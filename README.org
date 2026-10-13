@@ -58,6 +58,13 @@ They support:
 - Slash commands: type =/command args= or run =C-c C-o=.
 - Shell prompts: type =!command= to send shell output through OpenCode's shell
   prompt endpoint.
+- Clipboard images: copy a PNG or JPEG image, press =C-c C-i= to attach it to
+  the draft, then press =C-c C-c= to send the prompt and image. The input
+  prompt shows the number of attached images; =C-c C-d= removes the most
+  recently attached image. This uses =wl-paste= on Wayland, =xclip= on X11,
+  and PowerShell in STA mode on Windows (the clipboard image is converted to
+  PNG). Install =wl-clipboard= or =xclip= on Linux as needed; Windows needs
+  =pwsh= or =powershell= on =PATH=.
 - Subagent mentions: type =@agent= and complete with =C-<tab>=.
 - Tool output drawers: each completed tool call ends with a =▸= indicator.
   Press =TAB= or click the tool line to open the drawer and show the full
@@ -102,6 +109,9 @@ All commands auto-detect the current project root. Use a prefix argument
 (=C-u=) to choose a directory manually.
 
 ** Session Buffer Keybindings
+
+Clipboard images: =C-c C-i= attaches the current clipboard image to the draft;
+=C-c C-d= removes the latest attachment.
 
 | Key         | Command                                |
 |-------------+----------------------------------------|

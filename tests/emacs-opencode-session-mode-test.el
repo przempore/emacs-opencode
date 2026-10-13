@@ -341,6 +341,123 @@
       (should (equal (cdr (assoc "type" (cadr parts))) "agent"))
       (should (equal (cdr (assoc "name" (cadr parts))) "explore")))))
 
+(ert-deftest test-opencode-session-mode/build-parts-with-image-attachment ()
+  "Build message parts with a file attachment after the prompt text."
+  (let* ((attachment '(("type" . "file")
+                       ("mime" . "image/png")
+                       ("url" . "data:image/png;base64,aGVsbG8=")))
+         (parts (opencode-session--build-message-parts
+                 "Describe this" (list attachment))))
+    (should (= (length parts) 2))
+    (should (equal (cdr (assoc "type" (car parts))) "text"))
+    (should (equal (cdr (assoc "type" (cadr parts))) "file"))
+    (should (equal (cdr (assoc "mime" (cadr parts))) "image/png"))))
+
+(ert-deftest test-opencode-session-mode/build-parts-image-only ()
+  "Build a valid parts list when the prompt contains only an image."
+  (let* ((attachment '(("type" . "file")
+                       ("mime" . "image/png")
+                       ("url" . "data:image/png;base64,aGVsbG8=")))
+         (parts (opencode-session--build-message-parts "" (list attachment))))
+    (should (equal parts (list attachment)))))
+
+(ert-deftest test-opencode-session-mode/image-part-encodes-binary-data ()
+  "Encode image bytes as an OpenCode data-URL file part."
+  (let ((part (opencode-session--image-part "image/png" "hello")))
+    (should (equal (cdr (assoc "type" part)) "file"))
+    (should (equal (cdr (assoc "mime" part)) "image/png"))
+    (should (equal (cdr (assoc "filename" part)) "clipboard.png"))
+    (should (equal (cdr (assoc "url" part))
+                   "data:image/png;base64,aGVsbG8="))))
+
+(ert-deftest test-opencode-session-mode/attach-and-remove-clipboard-image ()
+  "Attach a clipboard image to the draft and remove it again."
+  (with-temp-buffer
+    (opencode-session-mode)
+    (cl-letf (((symbol-function 'opencode-session--clipboard-image-data)
+               (lambda () (cons "image/png" "hello"))))
+      (opencode-session-attach-clipboard-image))
+    (should (= (length opencode-session--attachments) 1))
+    (opencode-session-remove-last-attachment)
+    (should-not opencode-session--attachments)))
+
+(ert-deftest test-opencode-session-mode/read-clipboard-image-with-wl-paste ()
+  "Read binary PNG data from `wl-paste' without text conversion."
+  (let (command-args)
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (program) (and (equal program "wl-paste") program)))
+              ((symbol-function 'call-process)
+               (lambda (program _infile _destination _display &rest args)
+                 (setq command-args (cons program args))
+                 (insert "png-bytes")
+                 0)))
+      (let ((image (opencode-session--clipboard-image-data)))
+        (should (equal (car image) "image/png"))
+        (should (equal (cdr image) "png-bytes"))
+        (should (equal command-args
+                       '("wl-paste" "--no-newline" "--type" "image/png")))))))
+
+(ert-deftest test-opencode-session-mode/read-clipboard-image-with-pwsh ()
+  "Read and decode a PNG image through PowerShell in STA mode."
+  (let (command-args)
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (program) (and (equal program "pwsh") "pwsh.exe")))
+              ((symbol-function 'call-process)
+               (lambda (program _infile _destination _display &rest args)
+                 (setq command-args (cons program args))
+                 (insert "aGVsbG8=")
+                 0)))
+      (let ((image (opencode-session--windows-clipboard-image-data)))
+        (should (equal (car image) "image/png"))
+        (should (equal (cdr image) "hello"))
+        (should (equal (car command-args) "pwsh.exe"))
+        (should (member "-STA" command-args))
+        (should (string-match-p "Clipboard.*GetImage"
+                                (car (last command-args))))))))
+
+(ert-deftest test-opencode-session-mode/send-image-only-prompt ()
+  "Submit an image attachment with an empty text prompt."
+  (with-temp-buffer
+    (opencode-session-mode)
+    (setq-local opencode-session--session (opencode-session-create :id "s1"))
+    (setq-local opencode-session--attachments
+                (list (opencode-session--image-part "image/png" "png-bytes")))
+    (let (sent-parts)
+      (cl-letf (((symbol-function 'opencode-session--ensure-connection)
+                 (lambda (callback) (funcall callback 'connection)))
+                ((symbol-function 'opencode-client-session-prompt-async)
+                 (lambda (_connection _session-id parts &rest args)
+                   (setq sent-parts parts)
+                   (funcall (plist-get args :success))))
+                ((symbol-function 'message) #'ignore))
+        (opencode-session-send-input))
+      (should (equal sent-parts
+                     (list (opencode-session--image-part "image/png" "png-bytes"))))
+      (should-not opencode-session--attachments)
+      (should (equal (opencode-session--current-input) "")))))
+
+(ert-deftest test-opencode-session-mode/failed-image-send-restores-draft ()
+  "Restore the prompt and image attachment when sending fails."
+  (with-temp-buffer
+    (opencode-session-mode)
+    (setq-local opencode-session--session (opencode-session-create :id "s1"))
+    (setq-local opencode-session--attachments
+                (list (opencode-session--image-part "image/png" "png-bytes")))
+    (goto-char (point-max))
+    (insert "Describe this")
+    (let (failure-callback)
+      (cl-letf (((symbol-function 'opencode-session--ensure-connection)
+                 (lambda (callback) (funcall callback 'connection)))
+                ((symbol-function 'opencode-client-session-prompt-async)
+                 (lambda (_connection _session-id _parts &rest args)
+                   (setq failure-callback (plist-get args :error))))
+                ((symbol-function 'message) #'ignore))
+        (opencode-session-send-input)
+        (should-not opencode-session--attachments)
+        (funcall failure-callback))
+      (should (= (length opencode-session--attachments) 1))
+      (should (equal (opencode-session--current-input) "Describe this")))))
+
 ;;; agent-completion-bounds
 
 (ert-deftest test-opencode-session-mode/agent-bounds-at-trigger ()

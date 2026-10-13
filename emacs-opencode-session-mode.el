@@ -48,6 +48,9 @@ Each function receives SESSION and INPUT as arguments.")
 (defvar-local opencode-session--input-prompt-overlay nil
   "Overlay used to display the input prompt.")
 
+(defvar-local opencode-session--attachments nil
+  "Message file parts attached to the current session input.")
+
 ;;; Keymap and mode definition
 
 (defvar opencode-session-mode-map
@@ -63,6 +66,8 @@ Each function receives SESSION and INPUT as arguments.")
     (define-key map (kbd "C-c C-]") #'opencode-session-next-variant)
     (define-key map (kbd "C-c C-[") #'opencode-session-previous-variant)
     (define-key map (kbd "C-c C-o") #'opencode-command)
+    (define-key map (kbd "C-c C-i") #'opencode-session-attach-clipboard-image)
+    (define-key map (kbd "C-c C-d") #'opencode-session-remove-last-attachment)
     (define-key map (kbd "C-c C-t") #'opencode-session-toggle-reasoning)
     (define-key map (kbd "C-c C-f") #'opencode-session-fork)
     (define-key map (kbd "C-c C-x") #'opencode-session-compact)
@@ -93,6 +98,7 @@ Each function receives SESSION and INPUT as arguments.")
   (setq-local opencode-session--provider-id nil)
   (setq-local opencode-session--model-id nil)
   (setq-local opencode-session--variant nil)
+  (setq-local opencode-session--attachments nil)
   (setq-local opencode-session--show-reasoning opencode-session-show-reasoning)
   (opencode-session--ensure-markers)
   (add-hook 'completion-at-point-functions
@@ -297,12 +303,15 @@ message, fork the whole session."
   "Send the current input region content."
   (interactive)
   (let ((input (opencode-session--current-input)))
-    (if (string-empty-p (string-trim input))
+    (if (and (string-empty-p (string-trim input))
+             (null opencode-session--attachments))
         (message "OpenCode input is empty")
       (unless opencode-session--session
         (error "OpenCode session is not connected"))
       (let ((buffer (current-buffer))
-            (classified (opencode-session--classify-input input)))
+            (classified (if opencode-session--attachments
+                            (cons 'message input)
+                          (opencode-session--classify-input input))))
         (opencode-session--ensure-connection
          (lambda (connection)
            (when (buffer-live-p buffer)
@@ -383,6 +392,125 @@ message, fork the whole session."
   (opencode-session--maybe-goto-input)
   (yank arg))
 
+(defun opencode-session--linux-clipboard-image-data ()
+  "Return (MIME . DATA) for a Linux clipboard image.
+
+Use `wl-paste' on Wayland or `xclip' on X11.  PNG and JPEG clipboard
+formats are supported.  DATA is an unibyte string containing the image."
+  (let* ((mimes '("image/png" "image/jpeg"))
+         (readers (delq nil
+                        (list (and (executable-find "wl-paste")
+                                   (cons "wl-paste" '("--no-newline")))
+                              (and (executable-find "xclip")
+                                   (cons "xclip" '("-selection" "clipboard" "-o")))))))
+    (unless readers
+      (user-error "Install wl-clipboard (Wayland) or xclip (X11) to read clipboard images"))
+    (or
+     (catch 'image
+       (dolist (reader readers)
+         (dolist (mime mimes)
+           (let ((buffer (generate-new-buffer " *opencode-clipboard-image*")))
+             (unwind-protect
+                 (let* ((coding-system-for-read 'no-conversion)
+                        (args (if (equal (car reader) "wl-paste")
+                                  (append (cdr reader) (list "--type" mime))
+                                (append (cdr reader) (list "-t" mime))))
+                        (status (with-current-buffer buffer
+                                  (set-buffer-multibyte nil)
+                                  (apply #'call-process (car reader) nil t nil args))))
+                   (when (and (integerp status)
+                              (= status 0)
+                              (> (with-current-buffer buffer (buffer-size)) 0))
+                     (throw 'image
+                            (cons mime (with-current-buffer buffer (buffer-string))))))
+               (when (buffer-live-p buffer)
+                 (kill-buffer buffer)))))))
+     (user-error "Clipboard has no PNG or JPEG image"))))
+
+(defconst opencode-session--windows-clipboard-image-script
+  (concat
+   "Add-Type -AssemblyName System.Windows.Forms; "
+   "$image = [System.Windows.Forms.Clipboard]::GetImage(); "
+   "if ($null -eq $image) { exit 2 }; "
+   "$stream = [System.IO.MemoryStream]::new(); "
+   "$image.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png); "
+   "[Console]::Out.Write([Convert]::ToBase64String($stream.ToArray())); "
+   "$stream.Dispose(); $image.Dispose()")
+  "PowerShell command that writes a Windows clipboard image as PNG base64.")
+
+(defun opencode-session--windows-clipboard-image-data ()
+  "Return PNG image data from the Windows clipboard."
+  (let ((program (or (executable-find "pwsh")
+                     (executable-find "powershell"))))
+    (unless program
+      (user-error "Install PowerShell (pwsh) to read clipboard images"))
+    (let ((buffer (generate-new-buffer " *opencode-clipboard-image*")))
+      (unwind-protect
+          (let* ((coding-system-for-read 'no-conversion)
+                 (status (with-current-buffer buffer
+                           (set-buffer-multibyte nil)
+                           (call-process program nil t nil
+                                         "-NoLogo" "-NoProfile" "-NonInteractive"
+                                         "-STA" "-Command"
+                                         opencode-session--windows-clipboard-image-script)))
+                 (encoded (with-current-buffer buffer (buffer-string)))
+                 (data (and (integerp status) (= status 0)
+                            (condition-case nil
+                                (base64-decode-string encoded)
+                              (error nil)))))
+            (unless (and data (not (string-empty-p data)))
+              (user-error "PowerShell could not read an image from the clipboard"))
+            (cons "image/png" data))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(defun opencode-session--clipboard-image-data ()
+  "Return (MIME . DATA) for an image copied to the system clipboard."
+  (if (eq system-type 'windows-nt)
+      (opencode-session--windows-clipboard-image-data)
+    (opencode-session--linux-clipboard-image-data)))
+
+(defun opencode-session--image-part (mime data)
+  "Build an OpenCode file part from image MIME type and binary DATA."
+  (let* ((extension (if (equal mime "image/jpeg") "jpg" "png"))
+         (encoded (base64-encode-string data t)))
+    `(("type" . "file")
+      ("mime" . ,mime)
+      ("filename" . ,(concat "clipboard." extension))
+      ("url" . ,(concat "data:" mime ";base64," encoded)))))
+
+;;;###autoload
+(defun opencode-session-attach-clipboard-image ()
+  "Attach a PNG or JPEG image from the clipboard to the current prompt.
+
+Press `\[opencode-session-send-input]' to send the prompt and attached image.
+Use `\[opencode-session-remove-last-attachment]' to remove the most recently
+attached image."
+  (interactive)
+  (unless (derived-mode-p 'opencode-session-mode)
+    (error "Not in an OpenCode session buffer"))
+  (opencode-session--ensure-input-region)
+  (let* ((image (opencode-session--clipboard-image-data))
+         (part (opencode-session--image-part (car image) (cdr image))))
+    (setq-local opencode-session--attachments
+                (append opencode-session--attachments (list part)))
+    (opencode-session--ensure-input-prompt)
+    (message "Attached clipboard image (%s); send with C-c C-c" (car image))))
+
+;;;###autoload
+(defun opencode-session-remove-last-attachment ()
+  "Remove the most recently attached image from the current prompt."
+  (interactive)
+  (unless (derived-mode-p 'opencode-session-mode)
+    (error "Not in an OpenCode session buffer"))
+  (if opencode-session--attachments
+      (progn
+        (setq-local opencode-session--attachments
+                    (butlast opencode-session--attachments))
+        (opencode-session--ensure-input-prompt)
+        (message "Removed the most recently attached image"))
+    (message "No image attachments to remove")))
+
 (defun opencode-session-delete-backward (arg)
   "Delete ARG characters backward inside the input area."
   (interactive "p")
@@ -432,8 +560,14 @@ message, fork the whole session."
 (defun opencode-session--ensure-input-prompt ()
   "Ensure the input prompt overlay is up to date."
   (when opencode-session--input-start-marker
-    (let ((prompt opencode-session-input-prompt))
-      (if (or (null prompt) (string-empty-p prompt))
+    (let* ((prompt opencode-session-input-prompt)
+           (attachment-count (length opencode-session--attachments))
+           (label (concat prompt
+                          (when (> attachment-count 0)
+                            (format "[%d image%s] "
+                                    attachment-count
+                                    (if (= attachment-count 1) "" "s"))))))
+      (if (or (null label) (string-empty-p label))
           (when (overlayp opencode-session--input-prompt-overlay)
             (delete-overlay opencode-session--input-prompt-overlay)
             (setq opencode-session--input-prompt-overlay nil))
@@ -443,7 +577,7 @@ message, fork the whole session."
           (move-overlay opencode-session--input-prompt-overlay pos pos)
           (overlay-put opencode-session--input-prompt-overlay
                        'before-string
-                       (propertize prompt 'face 'opencode-session-input-prompt-face)))))))
+                       (propertize label 'face 'opencode-session-input-prompt-face)))))))
 
 (defun opencode-session--goto-input ()
   "Move point to the input region."
@@ -510,28 +644,36 @@ whitespace or appear at the start of the string."
         (setq start (match-end 0))))
     (delete-dups (nreverse mentions))))
 
-(defun opencode-session--build-message-parts (input)
+(defun opencode-session--build-message-parts (input &optional attachments)
   "Build the message parts list for INPUT.
-Returns a list of part alists including a text part and any @-agent
-parts extracted from the input."
-  (let ((text-part `(("type" . "text") ("text" . ,input)))
+Returns a list of part alists including a text part, ATTACHMENTS, and any
+@-agent parts extracted from the input.  An empty INPUT omits the text part."
+  (let ((text-part (unless (string-empty-p input)
+                     `(("type" . "text") ("text" . ,input))))
         (agent-names (opencode-session--extract-agent-mentions input))
-        (parts nil))
-    (push text-part parts)
+        (agent-parts nil))
     (dolist (name agent-names)
-      (push `(("type" . "agent") ("name" . ,name)) parts))
-    (nreverse parts)))
+      (push `(("type" . "agent") ("name" . ,name)) agent-parts))
+    (append (when text-part (list text-part))
+            attachments
+            (nreverse agent-parts))))
 
 (defun opencode-session--send-input (connection session input)
   "Send INPUT to SESSION using CONNECTION.
 
 Parses @-agent mentions from INPUT and includes them as agent parts
-alongside the text part.  Restores INPUT when the request fails."
-  (let ((session-id (opencode-session-id session))
-        (parts (opencode-session--build-message-parts input))
+alongside the text part.  Includes pending file attachments and restores
+INPUT and attachments when the request fails."
+  (let ((buffer (current-buffer))
+        (session-id (opencode-session-id session))
+        (attachments opencode-session--attachments)
+        (parts (opencode-session--build-message-parts
+                input opencode-session--attachments))
         (agent opencode-session--agent)
         (model (opencode-session--selected-model))
         (variant opencode-session--variant))
+    (setq-local opencode-session--attachments nil)
+    (opencode-session--ensure-input-prompt)
     (opencode-client-session-prompt-async
      connection
      session-id
@@ -542,8 +684,13 @@ alongside the text part.  Restores INPUT when the request fails."
      :success (lambda (&rest _args)
                 (message "OpenCode: message queued"))
      :error (lambda (&rest _args)
-              (opencode-session--restore-input input)
-                (message "OpenCode: failed to send message")))))
+              (when (buffer-live-p buffer)
+                (with-current-buffer buffer
+                  (opencode-session--restore-input input)
+                  (setq-local opencode-session--attachments
+                              (append attachments opencode-session--attachments))
+                  (opencode-session--ensure-input-prompt)
+                  (message "OpenCode: failed to send message")))))))
 
 (defun opencode-session--classify-input (input)
   "Classify INPUT and return (TYPE . PAYLOAD).
