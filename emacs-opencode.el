@@ -200,13 +200,32 @@ and skip prompting unless a prefix arg is supplied."
   (message "Disconnected from OpenCode"))
 
 ;;;###autoload
-(defun opencode-shutdown (&optional _directory)
-  "Disconnect Emacs from the shared OpenCode service.
-The obsolete DIRECTORY argument is ignored."
+(defun opencode-restart ()
+  "Restart the shared OpenCode service.
+This interrupts running work for every client.  Emacs reconnects on
+its own once the service is back."
   (interactive)
-  (opencode-disconnect))
-
-(defalias 'opencode-shutdown-all #'opencode-disconnect)
+  (when (y-or-n-p "Restart the OpenCode service for all clients? ")
+    (let ((buffer (generate-new-buffer " *opencode-service-restart*")))
+      (condition-case err
+          (progn
+            (make-process
+             :name "opencode-service-restart" :buffer buffer :noquery t
+             :command (list opencode-server-command "service" "restart")
+             :sentinel
+             (lambda (process _event)
+               (when (memq (process-status process) '(exit signal))
+                 (unwind-protect
+                     (if (zerop (process-exit-status process))
+                         (message "OpenCode service restarted")
+                       (message "OpenCode service restart failed: %s"
+                                (with-current-buffer buffer
+                                  (string-trim (buffer-string)))))
+                   (kill-buffer buffer)))))
+            (message "Restarting OpenCode service..."))
+        (error
+         (kill-buffer buffer)
+         (message "OpenCode service restart failed: %s" (error-message-string err)))))))
 
 ;;;###autoload
 (defun opencode-run-server (directory &optional on-ready)

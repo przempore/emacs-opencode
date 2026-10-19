@@ -53,10 +53,10 @@ which applies your service configuration. All projects use one connection
 and one event stream; sessions and catalogs remain directory-scoped.
 
 =M-x opencode-disconnect= closes Emacs's connection without stopping the
-service or other clients. Opening or sending to a session reconnects. To stop
-or restart the shared service for every client, use =opencode service stop=
-or =opencode service restart= in a terminal. Emacs rediscovers the registration
-on stream reconnect, including changed addresses and credentials.
+service or other clients. Opening or sending to a session reconnects.
+=M-x opencode-restart= restarts the shared service for every client, after
+asking for confirmation. Emacs rediscovers the registration on stream
+reconnect, including changed addresses and credentials.
 
 To return to an existing session, use =M-x opencode-open-session=. To send a
 prompt to an existing session from another buffer, use =M-x
@@ -135,9 +135,7 @@ include the 10 lines around point plus file and line metadata when available.
 | =opencode-send-context-to-session= | Send prompt + context to an existing session |
 | =opencode-mcp-status=              | Show current OpenCode MCP server status     |
 | =opencode-disconnect=              | Disconnect Emacs; keep the shared service running |
-
-=opencode-shutdown= and =opencode-shutdown-all= are compatibility names for
-disconnecting from the shared service.
+| =opencode-restart=                 | Restart the shared service for all clients  |
 
 All commands auto-detect the current project root. Use a prefix argument
 (=C-u=) to choose a directory manually.
