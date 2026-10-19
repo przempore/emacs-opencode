@@ -34,8 +34,6 @@
   process
   sse-process
   sse-state
-  sse-mode
-  sse-stderr-process
   sse-connected
   sse-retry-timer
   sse-retry-count)

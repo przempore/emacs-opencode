@@ -43,16 +43,6 @@ Within CALLS metadata, preserve JSON types in each call's INPUT."
   :type 'string
   :group 'emacs-opencode)
 
-(defcustom opencode-sse-backend 'auto
-  "SSE backend to use for streaming events.
-When set to `auto', prefer the JS bridge (bun or node) and fall
-back to curl.  Set to `bridge' to require the JS bridge or
-`curl' to force the legacy curl backend."
-  :type '(choice (const :tag "Auto-detect (prefer bridge)" auto)
-                 (const :tag "JS bridge (bun/node)" bridge)
-                 (const :tag "Curl (legacy)" curl))
-  :group 'emacs-opencode)
-
 (defcustom opencode-sse-log-output nil
   "When non-nil, log raw SSE output to the process buffer."
   :type 'boolean
@@ -326,7 +316,13 @@ is 1 (skip the \\n that completes the boundary)."
         (cons pos (+ pos 2)))))))
 
 (defun opencode-sse--process-chunk-1 (connection chunk)
-  "Internal: process SSE CHUNK for CONNECTION without profiling wrapper.
+  "Internal: process SSE CHUNK for CONNECTION without profiling wrapper."
+  (while chunk
+    (setq chunk (opencode-sse--consume-chunk connection chunk))))
+
+(defun opencode-sse--consume-chunk (connection chunk)
+  "Consume SSE CHUNK for CONNECTION up to the first event boundary.
+Returns the text after the boundary, or nil when none remains.
 
 Accumulates CHUNK into a reversed fragment list.  When the \\n\\n
 event boundary is detected (either within CHUNK or split across
@@ -341,42 +337,26 @@ large unhandled events (e.g. multi-megabyte session.diff)."
   (let ((boundary (opencode-sse--find-boundary connection chunk)))
     (if (not boundary)
         ;; No boundary — accumulate or drop, update trailing-nl.
-        (if (opencode-sse--read-state connection :dropping)
-            ;; Dropping: discard chunk, just track trailing-nl.
-            (opencode-sse--write-state
-             connection :trailing-nl
-             (string-suffix-p "\n" chunk))
-          ;; Not dropping — check if this is the first fragment.
-          (let ((fragments (opencode-sse--read-state connection :fragments)))
-            (if fragments
-                ;; Subsequent fragment — just push.
-                (progn
-                  (opencode-sse--write-state
-                   connection :fragments (cons chunk fragments))
-                  (opencode-sse--write-state
-                   connection :trailing-nl
-                   (string-suffix-p "\n" chunk)))
-              ;; First fragment — peek at event type.
-              (let ((event-type nil))
-                (when (string-prefix-p "data: " chunk)
-                  (setq event-type
-                        (opencode-sse--extract-event-type
-                         (substring chunk 6))))
-                (if (and event-type
-                         (null (alist-get event-type opencode-sse--handlers
-                                          nil nil #'string=)))
-                    ;; No handler — enter drop mode.
-                    (progn
-                      (opencode-sse--write-state connection :dropping t)
-                      (opencode-sse--write-state
-                       connection :trailing-nl
-                       (string-suffix-p "\n" chunk)))
-                  ;; Has handler (or type unknown) — accumulate.
-                  (opencode-sse--write-state
-                   connection :fragments (list chunk))
-                  (opencode-sse--write-state
-                   connection :trailing-nl
-                   (string-suffix-p "\n" chunk)))))))
+        (progn
+          (unless (opencode-sse--read-state connection :dropping)
+            (let ((fragments (opencode-sse--read-state connection :fragments)))
+              (cond
+               (fragments
+                (opencode-sse--write-state
+                 connection :fragments (cons chunk fragments)))
+               ;; First fragment of an event nobody handles.
+               ((when-let* (((string-prefix-p "data: " chunk))
+                            (event-type (opencode-sse--extract-event-type
+                                         (substring chunk 6))))
+                  (null (alist-get event-type opencode-sse--handlers
+                                   nil nil #'string=)))
+                (opencode-sse--write-state connection :dropping t))
+               (t
+                (opencode-sse--write-state
+                 connection :fragments (list chunk))))))
+          (opencode-sse--write-state
+           connection :trailing-nl (string-suffix-p "\n" chunk))
+          nil)
       ;; Boundary found — finalize or clear.
       (let* ((pre-end (car boundary))
              (rest (substring chunk (cdr boundary))))
@@ -389,7 +369,7 @@ large unhandled events (e.g. multi-megabyte session.diff)."
                  (all-fragments (if pre (cons pre fragments) fragments)))
             (opencode-sse--finalize-event connection all-fragments)))
         (unless (string-empty-p rest)
-          (opencode-sse--process-chunk connection rest))))))
+          rest)))))
 
 ;;; Reconnection
 
@@ -433,190 +413,9 @@ Does nothing when the stream was closed on purpose or the server is gone."
        (message "OpenCode: %s" error-message)
        (opencode-sse--handle-exit connection process)))))
 
-;;; Bridge backend
-;; A JS process (bun or node) that connects to the SSE endpoint, parses
-;; events, filters by type, strips large unused fields, and emits one
-;; JSON line per event to stdout.  Emacs reads complete lines from stdout
-;; and JSON-parses each one — no fragment accumulation needed.
+;;; Public API
 
-(defvar opencode-sse--bridge-script
-  (let* ((source (or load-file-name buffer-file-name))
-         (el-source (if (string-suffix-p ".elc" source)
-                        (substring source 0 -1)
-                      source)))
-    (expand-file-name "opencode-sse-bridge.js"
-                      (file-name-directory (file-truename el-source))))
-  "Path to the SSE bridge JS script.")
-
-(defun opencode-sse--find-js-runtime ()
-  "Return the first available JS runtime (\"bun\" or \"node\"), or nil."
-  (or (executable-find "bun")
-      (executable-find "node")))
-
-(defun opencode-sse--resolve-backend ()
-  "Return the backend to use: `bridge' or `curl'.
-Respects `opencode-sse-backend' and falls back based on availability."
-  (pcase opencode-sse-backend
-    ('curl 'curl)
-    ('bridge
-     (unless (opencode-sse--find-js-runtime)
-       (error "SSE bridge backend requires bun or node on PATH"))
-     'bridge)
-    ('auto
-     (if (opencode-sse--find-js-runtime) 'bridge 'curl))))
-
-(defun opencode-sse--bridge-auth-token (connection)
-  "Return the Base64 auth token for CONNECTION, or nil."
-  (when-let* ((password (opencode-connection-password connection)))
-    (let ((user (or (opencode-connection-username connection) "opencode")))
-      (base64-encode-string (format "%s:%s" user password) t))))
-
-(defun opencode-sse--bridge-events-arg ()
-  "Return a comma-separated string of registered event types."
-  (mapconcat #'car opencode-sse--handlers ","))
-
-(defun opencode-sse--build-bridge-command (connection)
-  "Build the bridge process command for CONNECTION."
-  (let ((runtime (opencode-sse--find-js-runtime))
-        (url (opencode-sse--build-url connection))
-        (events (opencode-sse--bridge-events-arg))
-        (auth (opencode-sse--bridge-auth-token connection)))
-    (append
-     (list runtime opencode-sse--bridge-script
-           "--url" url
-           "--events" events)
-     (when auth (list "--auth" auth)))))
-
-(defun opencode-sse--bridge-parse-line (line)
-  "Parse a single JSON LINE from the bridge into an alist.
-Returns the parsed alist, or nil on parse failure."
-  (condition-case nil
-      (opencode--json-value
-       (json-parse-string line :object-type 'hash-table :array-type 'array
-                          :null-object nil :false-object :json-false))
-    (error nil)))
-
-(defun opencode-sse--initialize-bridge-state (connection)
-  "Initialize SSE state for bridge mode on CONNECTION.
-State keys:
-  :line-buffer — incomplete line data from the process"
-  (setf (opencode-connection-sse-state connection)
-        (list :line-buffer "")))
-
-(defun opencode-sse--bridge-process-output (connection output)
-  "Process OUTPUT from the bridge for CONNECTION.
-Accumulates output into a line buffer and dispatches complete
-JSON lines to handlers."
-  (let* ((state (opencode-sse--ensure-state connection))
-         (buf (concat (plist-get state :line-buffer) output))
-         (lines (split-string buf "\n"))
-         (remainder (car (last lines)))
-         (complete-lines (butlast lines)))
-    ;; Process all complete lines (everything before the last element).
-    (dolist (line complete-lines)
-      (unless (string-empty-p line)
-        (let ((chunk-start
-               (and opencode-sse-profile-enabled
-                    (opencode-sse-profile--now))))
-          (if opencode-sse-profile-enabled
-              (let* ((parse-start (opencode-sse-profile--now))
-                     (parsed (opencode-sse--bridge-parse-line line))
-                     (parse-ms (opencode-sse-profile--elapsed-ms parse-start)))
-                (when parsed
-                  (let* ((event (alist-get 'type parsed))
-                         (dispatch-start (opencode-sse-profile--now)))
-                    (when event
-                      (opencode-sse--dispatch event parsed
-                                              (opencode-sse--event-meta connection event))
-                      (let ((dispatch-ms (opencode-sse-profile--elapsed-ms dispatch-start)))
-                        (opencode-sse-profile--record-finalize
-                         event parse-ms dispatch-ms (string-bytes line)))))))
-            (when-let* ((parsed (opencode-sse--bridge-parse-line line)))
-              (when-let* ((event (alist-get 'type parsed)))
-                (opencode-sse--dispatch event parsed
-                                        (opencode-sse--event-meta connection event)))))
-          (when chunk-start
-            (opencode-sse-profile--record-chunk
-             (opencode-sse-profile--elapsed-ms chunk-start)
-             (string-bytes line))))))
-    ;; Save any incomplete trailing data for the next call.
-    (plist-put state :line-buffer (or remainder ""))
-    (setf (opencode-connection-sse-state connection) state)))
-
-(defun opencode-sse--log-to-buffer (buffer text max-size)
-  "Append TEXT to log BUFFER, truncating if it exceeds MAX-SIZE."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (let ((inhibit-read-only t)
-            (inhibit-modification-hooks t)
-            (inhibit-redisplay t))
-        (save-excursion
-          (goto-char (point-max))
-          (insert text))
-        (when (and max-size (> (buffer-size) max-size))
-          (let ((target (/ max-size 2)))
-            (delete-region (point-min)
-                           (- (point-max) target))))))))
-
-(defun opencode-sse--open-bridge (connection)
-  "Open an SSE bridge process for CONNECTION.
-Returns the bridge process."
-  (let* ((runtime (opencode-sse--find-js-runtime))
-         (_ (unless runtime
-              (error "SSE bridge requires bun or node on PATH")))
-         (log-buffer (get-buffer-create
-                      (format " *opencode-sse<%s>*"
-                              (opencode-connection-directory connection))))
-         (stderr-buffer (get-buffer-create
-                         (format " *opencode-sse-stderr<%s>*"
-                                 (opencode-connection-directory connection))))
-         (command (opencode-sse--build-bridge-command connection))
-         (stderr-proc (make-pipe-process
-                       :name "opencode-sse-stderr"
-                       :buffer stderr-buffer
-                       :noquery t
-                       :filter (when opencode-sse-log-output
-                                 (lambda (_proc output)
-                                   (opencode-sse--log-to-buffer
-                                    log-buffer
-                                    (concat "[stderr] " output)
-                                    opencode-sse-log-max-size)))))
-         (process (make-process
-                   :name "opencode-sse"
-                   :buffer log-buffer
-                   :command command
-                   :noquery t
-                   :connection-type 'pipe
-                   :stderr stderr-proc
-                   :filter (lambda (proc output)
-                             (when opencode-sse-log-output
-                               (opencode-sse--log-to-buffer
-                                (process-buffer proc) output
-                                opencode-sse-log-max-size))
-                             (opencode-sse--bridge-process-output
-                              connection output))
-                   :sentinel (lambda (proc _event)
-                               (when (memq (process-status proc) '(exit signal))
-                                 (opencode-sse--log-to-buffer
-                                  log-buffer
-                                  "\n[opencode] SSE bridge stopped"
-                                  nil)
-                                 (opencode-sse--handle-exit connection proc))))))
-    (dolist (buf (list log-buffer stderr-buffer))
-      (with-current-buffer buf
-        (setq-local buffer-read-only t)
-        (setq-local buffer-undo-list t)
-        (setq-local auto-save-default nil)
-        (setq-local truncate-lines t)))
-    (opencode-sse--initialize-bridge-state connection)
-    (setf (opencode-connection-sse-mode connection) 'bridge)
-    (setf (opencode-connection-sse-process connection) process)
-    (setf (opencode-connection-sse-stderr-process connection) stderr-proc)
-    process))
-
-;;; Curl backend (legacy)
-
-(defun opencode-sse--open-curl (connection)
+(defun opencode-sse-open (connection)
   "Open an SSE stream via curl for CONNECTION.
 Returns the curl process."
   (opencode-sse--ensure-curl)
@@ -660,28 +459,8 @@ Returns the curl process."
       (setq-local buffer-undo-list t)
       (setq-local auto-save-default nil)
       (setq-local truncate-lines t))
-    (setf (opencode-connection-sse-mode connection) 'curl)
     (setf (opencode-connection-sse-process connection) process)
     process))
-
-;;; Public API
-
-(defun opencode-sse-open (connection)
-  "Open an SSE stream for CONNECTION.
-
-Selects the backend based on `opencode-sse-backend': the JS bridge
-\(bun/node) when available, falling back to curl.
-
-Returns the streaming process."
-  (let ((backend (opencode-sse--resolve-backend)))
-    (when (and (eq backend 'bridge)
-               (not (file-exists-p opencode-sse--bridge-script)))
-      (warn "OpenCode: bridge script not found at %s; falling back to curl"
-            opencode-sse--bridge-script)
-      (setq backend 'curl))
-    (pcase backend
-      ('bridge (opencode-sse--open-bridge connection))
-      ('curl   (opencode-sse--open-curl connection)))))
 
 (defun opencode-sse-close (connection)
   "Stop the SSE stream for CONNECTION."
@@ -697,16 +476,7 @@ Returns the streaming process."
     (when-let* ((buffer (process-buffer process)))
       (when (buffer-live-p buffer)
         (kill-buffer buffer))))
-  ;; Clean up stderr pipe process (bridge mode).
-  (when-let* ((stderr (opencode-connection-sse-stderr-process connection)))
-    (when (process-live-p stderr)
-      (delete-process stderr))
-    (when-let* ((buffer (process-buffer stderr)))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))
-    (setf (opencode-connection-sse-stderr-process connection) nil))
-  (setf (opencode-connection-sse-state connection) nil)
-  (setf (opencode-connection-sse-mode connection) nil))
+  (setf (opencode-connection-sse-state connection) nil))
 
 (provide 'emacs-opencode-sse)
 

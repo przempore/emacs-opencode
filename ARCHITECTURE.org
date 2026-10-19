@@ -90,9 +90,8 @@ block displayed in the parent session buffer.
 - Window point and scroll position should be preserved for users reading older
   output; windows already following the bottom should continue following it.
 - Tool output drawers are keyed by message-part identity so an open drawer
-  survives re-renders. The drawer body is only inserted while open, and the
-  full output is fetched on demand because the SSE bridge strips it from live
-  events.
+  survives re-renders. The drawer body is only inserted while open. Output that
+  has not arrived with the part is fetched when the drawer opens.
 - Header-line and retry banner state are derived from session status and message
   metadata, not from independent persistent UI state.
 

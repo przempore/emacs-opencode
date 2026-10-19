@@ -59,19 +59,17 @@
       (should (string-match-p "Unknown tool: tasks.missing"
                               (opencode-session--tool-part-line part))))))
 
-(ert-deftest test-opencode-codemode/json-arguments-survive-both-parsers ()
+(ert-deftest test-opencode-codemode/json-arguments-survive-parsing ()
   "Tool arguments keep false, null, arrays, and objects distinct."
   (let* ((json "{\"type\":\"session.tool.progress\",\"data\":{\"metadata\":{\"toolCalls\":[{\"tool\":\"tasks.list\",\"status\":\"running\",\"input\":{\"enabled\":false,\"empty\":null,\"filters\":[],\"options\":{},\"nested\":[{}]}},{\"tool\":\"tasks.list\",\"status\":\"completed\",\"input\":{}}]}}}")
-         (http (with-temp-buffer (insert json) (goto-char (point-min)) (opencode--json-read)))
-         (bridge (opencode-sse--bridge-parse-line json)))
-    (dolist (event (list http bridge))
-      (let ((text (opencode-session--execute-calls (alist-get 'metadata (alist-get 'data event)))))
-        (should (string-match-p (regexp-quote "\"enabled\":false") text))
-        (should (string-match-p (regexp-quote "\"empty\":null") text))
-        (should (string-match-p (regexp-quote "\"filters\":[]") text))
-        (should (string-match-p (regexp-quote "\"options\":{}") text))
-        (should (string-match-p (regexp-quote "\"nested\":[{}]") text))
-        (should (string-match-p (regexp-quote "tasks.list [completed] {}") text))))))
+         (event (opencode-sse--decode-data json))
+         (text (opencode-session--execute-calls (alist-get 'metadata (alist-get 'data event)))))
+    (should (string-match-p (regexp-quote "\"enabled\":false") text))
+    (should (string-match-p (regexp-quote "\"empty\":null") text))
+    (should (string-match-p (regexp-quote "\"filters\":[]") text))
+    (should (string-match-p (regexp-quote "\"options\":{}") text))
+    (should (string-match-p (regexp-quote "\"nested\":[{}]") text))
+    (should (string-match-p (regexp-quote "tasks.list [completed] {}") text))))
 
 (provide 'emacs-opencode-codemode-test)
 ;;; emacs-opencode-codemode-test.el ends here

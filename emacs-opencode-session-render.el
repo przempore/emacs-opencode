@@ -83,8 +83,7 @@ deleted on every status update.")
 
 (defun opencode-session--tool-output (part)
   "Return the output text for PART, or nil when it has not been fetched.
-Bash reports its output in metadata, which arrives over SSE; other
-tools only carry output in state, which the SSE bridge strips."
+Bash reports its output in metadata; other tools carry it in state."
   (let* ((state (opencode-message-part-state part))
          (metadata (alist-get 'metadata state))
          (output (or (alist-get 'output state)

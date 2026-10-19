@@ -17,7 +17,7 @@ Requirements:
 - OpenCode 2 (the =opencode= CLI) on your =$PATH= ([[https://opencode.ai/v2/docs/][install docs]]). OpenCode
   1 users should use the =v1= tag (see below).
 - The Emacs package =request=
-- =bun= or =node= recommended for performant SSE streaming; =curl= is used as a fallback
+- =curl= on your =$PATH= for SSE streaming
 
 Clone the repository and add it to your =load-path=:
 
@@ -263,8 +263,7 @@ SSE and diagnostics options:
 
 | Variable                                      | Default       | Description                              |
 |-----------------------------------------------+---------------+------------------------------------------|
-| =opencode-sse-backend=                        | =auto=        | Prefer JS bridge, fall back to curl      |
-| =opencode-sse-curl-command=                   | ="curl"=      | Curl executable for fallback streaming   |
+| =opencode-sse-curl-command=                   | ="curl"=      | Curl executable for SSE streaming        |
 | =opencode-sse-log-output=                     | =nil=         | Log raw SSE output to the process buffer |
 | =opencode-sse-log-max-size=                   | =1048576=     | Max bytes kept in SSE log buffer         |
 | =opencode-sse-profile-enabled=                | =nil=         | Collect SSE performance timing data      |
